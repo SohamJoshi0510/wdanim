@@ -1,5 +1,4 @@
 import re
-
 import cv2
 import numpy as np
 import os
@@ -11,6 +10,7 @@ import ctypes
 import subprocess
 import pickle
 import hashlib
+from pathlib import Path
 
 # 1. Configuration & CLI Argument Handling
 if len(sys.argv) < 2:
@@ -372,7 +372,7 @@ if is_image:
     # For a single image there's nothing to animate, and clearing the terminal would
     # just wipe the art away immediately -- print it once, straight to normal
     # scrollback, and leave it on screen.
-    char_rows, color_codes = ascii_frames[0]
+    char_rows, color_codes = ascii_frames[0] if Path(video_path).exists() else sys.exit(0)
     frame_string = build_frame_string(char_rows, color_codes)
     print_with_delay(frame_string)
 else:
