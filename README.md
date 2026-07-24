@@ -3,11 +3,6 @@
 Play videos and images as colored ASCII/ANSI art directly in your terminal, with synced audio, true per-pixel color matching, and a handful of stylized rendering modes.
 
 ## Features
-# wdanim
-
-Play videos and images as colored ASCII/ANSI art directly in your terminal, with synced audio, true per-pixel color matching, and a handful of stylized rendering modes.
-
-## Features
 
 - **Two render modes** — a brightness-gradient mode (`.:-=+*#%@`) or a Canny edge-detection mode that draws outlines instead of filled shading.
 - **True color matching** — samples the actual RGB of every source pixel and matches it to the *closest* of the real 256 xterm ANSI colors (not an approximation formula — an actual nearest-neighbor search), so the ASCII art's colors reflect the real footage.
