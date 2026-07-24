@@ -1,4 +1,6 @@
+from pathlib import Path
 import re
+
 import cv2
 import numpy as np
 import os
@@ -10,11 +12,10 @@ import ctypes
 import subprocess
 import pickle
 import hashlib
-from pathlib import Path
 
 # 1. Configuration & CLI Argument Handling
 if len(sys.argv) < 2:
-    print("Usage: python script.py <path_to_video> [-color] [-edge] [-negative] [-moz] [-wish \"TEXT\"] [-frames N] [-start SS] [-end SS] [-save]")
+    print("Usage: python wdanim.py <path_to_video> [-color] [-edge] [-negative] [-moz] [-wish \"TEXT\"] [-frames N] [-start SS] [-end SS] [-save]")
     sys.exit(1)
 
 video_path = sys.argv[1]
@@ -35,6 +36,7 @@ if use_wish:
     except TypeError:
         print("Error: -wish must be a string")
         sys.exit(1)
+
 
 use_mozaic = '-moz' in sys.argv
 use_color = '-color' in sys.argv
@@ -119,7 +121,7 @@ if use_wish:
     wish_ptr = -1
     ASCII_GRADIENT =  WISH[wish_ptr]  # dark -> light == sparse -> dense
 if use_mozaic:
-    ASCII_GRADIENT = "▄"
+    ASCII_GRADIENT = '.'
 
 def enable_windows_ansi():
     """Turn on native VT100 processing so raw ANSI escape codes (cursor movement,
@@ -178,7 +180,10 @@ def build_frame_string(char_rows, color_codes):
             style = None
             if color_codes is not None and ch != ' ':
                 code = int(color_codes[y, x])
-                style = f'\x1b[38;5;{code}m'
+                if use_mozaic:
+                    style = f'\x1b[38;5;{code};48;5;{code}m'
+                else:
+                    style = f'\x1b[38;5;{code}m'
             if style != last_style:
                 if last_style is not None:
                     parts.append('\x1b[0m')
@@ -232,7 +237,9 @@ def compute_cache_key(w):
     stat = os.stat(video_path)
     fingerprint = (
         os.path.abspath(video_path), stat.st_mtime, stat.st_size,
-        use_edge, use_color, use_negative, max_frames, start_time, end_time, w,
+        use_edge, use_color, use_negative, use_mozaic,
+        use_wish, WISH if use_wish else None,
+        max_frames, start_time, end_time, w,
     )
     return hashlib.sha256(repr(fingerprint).encode()).hexdigest()[:16]
 
