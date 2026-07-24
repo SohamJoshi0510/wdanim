@@ -31,7 +31,7 @@ numpy
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/wdanim.git
+git clone https://github.com/SohamJoshi0510/wdanim.git
 cd wdanim
 pip install -r requirements.txt
 ```
@@ -119,7 +119,7 @@ numpy
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/wdanim.git
+git clone https://github.com/SohamJoshi0510/wdanim.git
 cd wdanim
 pip install -r requirements.txt
 ```
