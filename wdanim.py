@@ -1,443 +1,537 @@
-from pathlib import Path
+#!/usr/bin/env python3
+"""wdanim - play videos and images as colored ASCII/ANSI art in your terminal.
+
+Usage: python wdanim.py <video_or_image> [-color] [-edge] [-negative] [-moz]
+                        [-wish TEXT] [-frames N] [-start T] [-end T] [-save]
+                        [-width N] [-typedelay SECONDS]
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import itertools
+import json
+import math
+import os
 import re
+import shutil
+import subprocess
+import sys
+import time
 
 import cv2
 import numpy as np
-import os
-import sys
-import time
-import msvcrt
-import threading
-import ctypes
-import subprocess
-import pickle
-import hashlib
 
-# 1. Configuration & CLI Argument Handling
-if len(sys.argv) < 2:
-    print("Usage: python wdanim.py <path_to_video> [-color] [-edge] [-negative] [-moz] [-wish \"TEXT\"] [-frames N] [-start SS] [-end SS] [-save]")
-    sys.exit(1)
+CACHE_VERSION = 2
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif"}
 
-video_path = sys.argv[1]
+GRADIENT = np.array(list(" .:-=+*#%@"))   # dark -> light == sparse -> dense
+EDGE_CHARS = np.array(list("#*=+:."))
+RESET = "\x1b[0m"
+HALF_BLOCK = "\u2580"                      # upper half block: fg = top pixel, bg = bottom pixel
+TERMINAL_CELL_ASPECT = 0.5                 # terminal cells are roughly twice as tall as wide
 
-IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.tif'}
-is_image = os.path.splitext(video_path)[1].lower() in IMAGE_EXTENSIONS
 
-# Parsing flags
-use_wish = '-wish' in sys.argv
+class UserError(Exception):
+    """A problem the user can fix (bad path, bad flag combination, ...)."""
 
-if use_wish:
-    idx = sys.argv.index('-wish')
-    if idx + 1 >= len(sys.argv):
-        print("Error: -wish flag requires a string(wish), e.g. -wish happybirthdaysoham")
-        sys.exit(1)
+
+# --------------------------------------------------------------------------- CLI
+
+def positive_int(value: str) -> int:
     try:
-        WISH = str(sys.argv[idx + 1])
-    except TypeError:
-        print("Error: -wish must be a string")
-        sys.exit(1)
-
-
-use_mozaic = '-moz' in sys.argv
-use_color = '-color' in sys.argv
-use_edge = '-edge' in sys.argv
-use_negative = '-negative' in sys.argv
-use_save = '-save' in sys.argv
-
-if use_wish and not use_color:
-    print("Note: -wish looks best with -color -- ignoring it without -color.")
-    use_wish = False
-
-max_frames = None
-if '-frames' in sys.argv:
-    idx = sys.argv.index('-frames')
-    if idx + 1 >= len(sys.argv):
-        print("Error: -frames flag requires a number, e.g. -frames 150")
-        sys.exit(1)
-    try:
-        max_frames = int(sys.argv[idx + 1])
-        if max_frames <= 0:
-            raise ValueError
+        number = int(value)
     except ValueError:
-        print("Error: -frames must be a positive integer")
-        sys.exit(1)
+        number = 0
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
-def parse_timestamp(value):
-    """Accepts plain seconds ('90', '12.5') or 'MM:SS' / 'HH:MM:SS' and returns seconds as a float."""
-    if ':' in value:
-        parts = value.split(':')
-        try:
-            parts = [float(p) for p in parts]
-        except ValueError:
-            return None
+def parse_timestamp(value: str) -> float:
+    """Accepts seconds ('90', '12.5') or 'MM:SS' / 'HH:MM:SS' and returns seconds."""
+    try:
         seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60 + part
-        return seconds
-    try:
-        return float(value)
+        for part in value.split(":"):
+            seconds = seconds * 60 + float(part)
     except ValueError:
+        seconds = -1.0
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be seconds (e.g. 30) or MM:SS / HH:MM:SS")
+    return seconds
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="wdanim", allow_abbrev=False,
+        description="Play videos and images as colored ASCII/ANSI art in the terminal.",
+    )
+    p.add_argument("path", help="video or image file")
+    p.add_argument("-color", action="store_true",
+                   help="match each cell to the nearest xterm-256 color of the source pixel")
+    p.add_argument("-edge", action="store_true", help="Canny edge outlines instead of brightness shading")
+    p.add_argument("-negative", action="store_true", help="invert brightness and color")
+    p.add_argument("-moz", action="store_true",
+                   help="mosaic mode: solid half-block pixels (2 per cell vertically); overrides -edge/-wish")
+    p.add_argument("-wish", metavar="TEXT", help="spell TEXT across the art (needs -color)")
+    p.add_argument("-frames", type=positive_int, metavar="N", help="process at most N frames")
+    p.add_argument("-start", type=parse_timestamp, metavar="T", help="start point: SS, MM:SS or HH:MM:SS")
+    p.add_argument("-end", type=parse_timestamp, metavar="T", help="end point: SS, MM:SS or HH:MM:SS")
+    p.add_argument("-save", action="store_true", help="cache rendered frames next to the video")
+    p.add_argument("-width", type=positive_int, metavar="N",
+                   help="width in characters (default: fit the terminal)")
+    p.add_argument("-typedelay", type=float, default=0.005, metavar="SECONDS",
+                   help="per-character delay when typing out an image (default 0.005, 0 = instant)")
+    args = p.parse_args(argv)
+    if args.start is not None and args.end is not None and args.end <= args.start:
+        p.error("-end must be greater than -start")
+    return args
+
+
+def normalise_flags(opts: argparse.Namespace) -> list[str]:
+    """Resolve flag combinations that don't make sense; returns notes to show the user."""
+    notes = []
+    if opts.moz:
+        if opts.edge or opts.wish:
+            notes.append("-moz overrides -edge and -wish.")
+        opts.edge, opts.wish = False, None
+    elif opts.edge and opts.wish:
+        notes.append("-wish has no effect together with -edge; ignoring it.")
+        opts.wish = None
+    elif opts.wish and not opts.color:
+        notes.append("-wish looks best with -color -- ignoring it without -color.")
+        opts.wish = None
+    return notes
+
+
+# ------------------------------------------------------------------- terminal I/O
+
+def enable_windows_ansi() -> None:
+    """Turn on VT100 processing so ANSI escape codes work in Windows consoles."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
+class KeyListener:
+    """Non-blocking 'was Esc or q pressed?' check on Windows, Linux and macOS."""
+
+    def __init__(self) -> None:
+        self.enabled = sys.stdin is not None and sys.stdin.isatty()
+        self._windows = os.name == "nt"
+        self._fd = None
+        self._saved = None
+
+    def __enter__(self) -> "KeyListener":
+        if self.enabled and not self._windows:
+            import termios
+            import tty
+            self._fd = sys.stdin.fileno()
+            self._saved = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._saved is not None:
+            import termios
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+
+    def abort_requested(self) -> bool:
+        if not self.enabled:
+            return False
+        pressed = False
+        if self._windows:
+            import msvcrt
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):      # arrow/function key prefix: swallow the 2nd code
+                    msvcrt.getwch()
+                elif ch in ("\x1b", "q", "Q"):
+                    pressed = True
+        else:
+            import select
+            while select.select([self._fd], [], [], 0)[0]:
+                data = os.read(self._fd, 64)
+                if not data:
+                    break
+                # a lone ESC byte is the Esc key; arrow keys arrive as ESC [ A etc.
+                if data == b"\x1b" or b"q" in data or b"Q" in data:
+                    pressed = True
+        return pressed
+
+
+# ----------------------------------------------------------------- colour matching
+
+def build_ansi256_palette() -> np.ndarray:
+    """RGB values of xterm colors 16..255 (6x6x6 cube + 24 grays).
+
+    Colors 0..15 are left out on purpose: terminals let users re-theme them, so
+    their real RGB is unpredictable, while 16..255 are fixed.
+    """
+    steps = [0, 95, 135, 175, 215, 255]
+    cube = [(r, g, b) for r in steps for g in steps for b in steps]
+    grays = [(8 + 10 * i,) * 3 for i in range(24)]
+    return np.array(cube + grays, dtype=np.int32)  # (240, 3), index i -> color code i + 16
+
+
+class ColorMatcher:
+    """Nearest-palette-color lookup via a precomputed 64x64x64 table (6 bits per channel)."""
+
+    BITS = 6
+
+    def __init__(self) -> None:
+        palette = build_ansi256_palette()
+        n = 1 << self.BITS
+        self.shift = 8 - self.BITS
+        centers = (np.arange(n) << self.shift) + (1 << (self.shift - 1))
+        g, b = np.meshgrid(centers, centers, indexing="ij")
+        gb = np.stack([g.ravel(), b.ravel()], axis=1)                       # (n*n, 2)
+        dist_gb = ((gb[:, None, :] - palette[None, :, 1:]) ** 2).sum(axis=2)  # (n*n, 240)
+        self.lut = np.empty((n, n, n), dtype=np.uint8)
+        for ri, r in enumerate(centers):
+            dist = dist_gb + (r - palette[:, 0]) ** 2
+            self.lut[ri] = (np.argmin(dist, axis=1) + 16).reshape(n, n)
+
+    def codes(self, rgb: np.ndarray) -> np.ndarray:
+        q = rgb >> self.shift
+        return self.lut[q[..., 0], q[..., 1], q[..., 2]]
+
+
+# ---------------------------------------------------------------------- rendering
+
+def rows_to_text(chars: np.ndarray) -> str:
+    return "\n".join("".join(row) for row in chars.tolist())
+
+
+def styled_rows(chars: np.ndarray, codes: np.ndarray) -> str:
+    """Characters + per-cell xterm-256 foreground codes. Blank cells inherit the current
+    style (they have no visible foreground), so runs stay long and frames stay small."""
+    lines = []
+    for ch_row, code_row in zip(chars.tolist(), codes.tolist()):
+        parts: list[str] = []
+        last = None
+        for ch, code in zip(ch_row, code_row):
+            if ch == " ":
+                code = last
+            if code != last:
+                parts.append(f"\x1b[38;5;{code}m")
+                last = code
+            parts.append(ch)
+        if last is not None:
+            parts.append(RESET)
+        lines.append("".join(parts))
+    return "\n".join(lines)
+
+
+class Renderer:
+    """Turns BGR frames into ready-to-print ANSI strings."""
+
+    def __init__(self, opts: argparse.Namespace, width: int, rows: int) -> None:
+        self.opts, self.width, self.rows = opts, width, rows
+        self.matcher = ColorMatcher() if (opts.color or opts.moz) else None
+        self.wish = np.array(list(opts.wish)) if opts.wish else None
+        self.wish_offset = 0  # the message keeps scrolling across frames
+
+    def render(self, frame: np.ndarray) -> str:
+        if self.opts.negative:
+            frame = cv2.bitwise_not(frame)
+        if self.opts.moz:
+            return self._half_blocks(frame)
+
+        small = cv2.resize(frame, (self.width, self.rows), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if self.opts.edge:
+            chars = self._edge_chars(gray)
+        elif self.wish is not None:
+            chars = self._wish_chars()
+        else:
+            chars = GRADIENT[gray.astype(np.int32) * len(GRADIENT) // 256]
+
+        if self.matcher is None:
+            return rows_to_text(chars)
+        codes = self.matcher.codes(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+        return styled_rows(chars, codes)
+
+    @staticmethod
+    def _edge_chars(gray: np.ndarray) -> np.ndarray:
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 50, 150)
+        edge_chars = EDGE_CHARS[gray.astype(np.int32) * len(EDGE_CHARS) // 256]
+        fill = np.where(gray < 128, " ", ".")
+        return np.where(edges > 0, edge_chars, fill)
+
+    def _wish_chars(self) -> np.ndarray:
+        count = self.width * self.rows
+        idx = (self.wish_offset + np.arange(count)) % len(self.wish)
+        self.wish_offset = (self.wish_offset + count) % len(self.wish)
+        return self.wish[idx].reshape(self.rows, self.width)
+
+    def _half_blocks(self, frame: np.ndarray) -> str:
+        small = cv2.resize(frame, (self.width, self.rows * 2), interpolation=cv2.INTER_AREA)
+        if not self.opts.color:  # mosaic without -color: grayscale blocks
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            small = cv2.merge([gray, gray, gray])
+        codes = self.matcher.codes(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+        lines = []
+        for top_row, bottom_row in zip(codes[0::2].tolist(), codes[1::2].tolist()):
+            parts = []
+            for (top, bottom), run in itertools.groupby(zip(top_row, bottom_row)):
+                parts.append(f"\x1b[38;5;{top};48;5;{bottom}m{HALF_BLOCK * len(list(run))}")
+            parts.append(RESET)
+            lines.append("".join(parts))
+        return "\n".join(lines)
+
+
+def pick_size(src_w: int, src_h: int, opts: argparse.Namespace, term, fit_height: bool):
+    """Returns (width, rows) in terminal cells, fitted to the terminal unless -width is given."""
+    cols, lines = term
+    aspect = src_h / src_w * TERMINAL_CELL_ASPECT   # cell rows per cell column
+    if opts.width:
+        width = opts.width
+    else:
+        width = max(20, cols - 1)                    # leave the last column free to avoid wrapping
+        if fit_height and width * aspect > lines - 1:
+            width = max(20, int((lines - 1) / aspect))
+    return width, max(1, round(width * aspect))
+
+
+# ------------------------------------------------------------------------- cache
+
+def cache_path_for(opts: argparse.Namespace, width: int) -> str:
+    stat = os.stat(opts.path)
+    fingerprint = repr((
+        CACHE_VERSION, os.path.abspath(opts.path), stat.st_mtime_ns, stat.st_size,
+        opts.color, opts.edge, opts.negative, opts.moz, opts.wish,
+        opts.frames, opts.start, opts.end, width,
+    ))
+    digest = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+    folder = os.path.join(os.path.dirname(os.path.abspath(opts.path)), ".ascii_cache")
+    return os.path.join(folder, f"{os.path.basename(opts.path)}.{digest}.cache")
+
+
+def load_cache(path: str):
+    """Returns (frames, fps) or None if the cache is missing, stale or damaged."""
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", newline="\n") as f:
+            header = json.loads(f.readline())
+            frames = f.read().split("\x00")
+        if header.get("version") != CACHE_VERSION or len(frames) != header.get("frames"):
+            return None
+        return frames, float(header["fps"])
+    except (OSError, ValueError, KeyError, EOFError):
         return None
 
 
-start_time = None
-if '-start' in sys.argv:
-    idx = sys.argv.index('-start')
-    if idx + 1 >= len(sys.argv):
-        print("Error: -start flag requires a timestamp, e.g. -start 30 or -start 1:30")
-        sys.exit(1)
-    start_time = parse_timestamp(sys.argv[idx + 1])
-    if start_time is None or start_time < 0:
-        print("Error: -start must be seconds (e.g. 30) or MM:SS / HH:MM:SS")
-        sys.exit(1)
-
-end_time = None
-if '-end' in sys.argv:
-    idx = sys.argv.index('-end')
-    if idx + 1 >= len(sys.argv):
-        print("Error: -end flag requires a timestamp, e.g. -end 90 or -end 2:00")
-        sys.exit(1)
-    end_time = parse_timestamp(sys.argv[idx + 1])
-    if end_time is None or end_time < 0:
-        print("Error: -end must be seconds (e.g. 90) or MM:SS / HH:MM:SS")
-        sys.exit(1)
-
-if start_time is not None and end_time is not None and end_time <= start_time:
-    print("Error: -end must be greater than -start")
-    sys.exit(1)
-
-# State variables for playback timing
-if is_image:
-    playback_speed = 0.1
-else:
-    playback_speed = 1.0  # Drops to 0.0 if ESC is pressed
-
-# Characters for structural lines (edge mode) and brightness gradient (standard mode)
-EDGE_CHARS = ["#", "*", "=", "+", ":", "."]
-ASCII_GRADIENT = ' .:-=+*#%@'
-
-if use_wish:
-    wish_ptr = -1
-    ASCII_GRADIENT =  WISH[wish_ptr]  # dark -> light == sparse -> dense
-if use_mozaic:
-    ASCII_GRADIENT = '.'
-
-def enable_windows_ansi():
-    """Turn on native VT100 processing so raw ANSI escape codes (cursor movement,
-    256-color foreground codes) work correctly on Windows consoles."""
-    if os.name == 'nt':
-        kernel32 = ctypes.windll.kernel32
-        h = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
-        kernel32.GetConsoleMode(h, ctypes.byref(mode))
-        kernel32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+def save_cache(path: str, frames: list[str], fps: float) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8", newline="\n", compresslevel=3) as f:
+            f.write(json.dumps({"version": CACHE_VERSION, "fps": fps, "frames": len(frames)}) + "\n")
+            f.write("\x00".join(frames))
+        os.replace(tmp, path)
+        print(f"Saved {len(frames)} frames to cache; the same video and flags will load instantly next time.")
+    except OSError as exc:
+        print(f"Note: could not write cache ({exc}).")
 
 
-enable_windows_ansi()
+# -------------------------------------------------------------------------- video
 
+def load_video_frames(opts: argparse.Namespace, term) -> tuple[list[str], float]:
+    cap = cv2.VideoCapture(opts.path)
+    if not cap.isOpened():
+        raise UserError(f"could not open video: {opts.path}")
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or not math.isfinite(fps) or fps <= 0:
+            fps = 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if src_w <= 0 or src_h <= 0:
+            raise UserError("could not read the video dimensions")
 
-# --- ANSI-256 nearest-color matching -----------------------------------------------
-def _build_ansi256_palette():
-    """Builds the actual RGB values of all 256 standard xterm ANSI colors, so we can
-    find which one is truly closest to a given pixel's real color."""
-    basic = [
-        (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
-        (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
-        (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0),
-        (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
-    ]
-    cube_steps = [0, 95, 135, 175, 215, 255]
-    cube = [(cube_steps[r], cube_steps[g], cube_steps[b])
-            for r in range(6) for g in range(6) for b in range(6)]
-    gray = [(8 + 10 * i,) * 3 for i in range(24)]
-    return np.array(basic + cube + gray, dtype=np.int32)  # shape (256, 3)
+        duration = total / fps if total > 0 else None
+        if opts.start is not None and duration is not None and opts.start >= duration:
+            raise UserError(f"-start ({opts.start}s) is beyond the video length ({duration:.1f}s)")
 
+        width, rows = pick_size(src_w, src_h, opts, term, fit_height=True)
 
-ANSI256_PALETTE = _build_ansi256_palette()
+        cache_path = cache_path_for(opts, width) if opts.save else None
+        if cache_path and os.path.exists(cache_path):
+            print("Matching cache found -- loading pre-rendered frames...")
+            cached = load_cache(cache_path)
+            if cached:
+                print(f"Loaded {len(cached[0])} cached frames.")
+                return cached
+            print("Cache was unreadable; re-rendering.")
 
+        limit = opts.frames
+        if opts.end is not None:
+            end_frames = math.ceil((opts.end - (opts.start or 0.0)) * fps)
+            limit = end_frames if limit is None else min(limit, end_frames)
+        if opts.start:
+            cap.set(cv2.CAP_PROP_POS_MSEC, opts.start * 1000)
 
-def rgb_array_to_ansi256(rgb):
-    """rgb: HxWx3 array (R,G,B). Returns an HxW array of the nearest ANSI-256 color
-    code for each pixel, found by true Euclidean distance against the real palette."""
-    h, w, _ = rgb.shape
-    pixels = rgb.reshape(-1, 1, 3).astype(np.int32)              # (N,1,3)
-    diffs = pixels - ANSI256_PALETTE[None, :, :]                  # (N,256,3)
-    dist_sq = np.einsum('ijk,ijk->ij', diffs, diffs)              # (N,256)
-    nearest = np.argmin(dist_sq, axis=-1)                          # (N,)
-    return nearest.reshape(h, w)
+        expected = None
+        if total > 0:
+            remaining = total - int((opts.start or 0.0) * fps)
+            expected = max(1, min(limit, remaining) if limit else remaining)
 
+        mode = "mosaic" if opts.moz else "edge detection" if opts.edge else "brightness gradient"
+        print(f"Processing video ({mode}, {width}x{rows} cells"
+              f"{', color' if opts.color else ''}{', negative' if opts.negative else ''})...")
 
-def build_frame_string(char_rows, color_codes):
-    """Combines the character grid with per-cell ANSI-256 color codes. Non-space
-    cells get a foreground color match; space cells are left uncolored.
-    Consecutive cells with identical styling share one escape code to stay compact."""
-    lines = []
-    for y, row_chars in enumerate(char_rows):
-        parts = []
-        last_style = None
-        for x, ch in enumerate(row_chars):
-            style = None
-            if color_codes is not None and ch != ' ':
-                code = int(color_codes[y, x])
-                if use_mozaic:
-                    style = f'\x1b[38;5;{code};48;5;{code}m'
-                else:
-                    style = f'\x1b[38;5;{code}m'
-            if style != last_style:
-                if last_style is not None:
-                    parts.append('\x1b[0m')
-                if style is not None:
-                    parts.append(style)
-                last_style = style
-            parts.append(ch)
-        if last_style is not None:
-            parts.append('\x1b[0m')
-        lines.append(''.join(parts))
-    return '\n'.join(lines)
-
-def print_with_delay(text):
-    global playback_speed
-    delay = playback_speed
-    # Matches ANSI escape codes, standard escape sequences, or single characters
-    pattern = re.compile(r"(\x1b\[[0-9;]*[a-zA-Z]|.)", re.DOTALL)
-
-    for match in pattern.finditer(text):
-        token = match.group()
-
-        sys.stdout.write(token)
-        sys.stdout.flush()
-
-        # Only delay if it is a visible character, not an escape code
-        if not token.startswith("\x1b") and not token.startswith("\\"):
-            delay = playback_speed
-            time.sleep(delay)
-
-# 2. Background Escape Key Listener
-def check_esc():
-    """Listens for the Escape key to instantly skip frame delays."""
-    global playback_speed
-    while True:
-        if msvcrt.kbhit():
-            key = msvcrt.getwch()
-            if key == "\x1b":  # ESC key hex code
-                playback_speed = 0.0
+        renderer = Renderer(opts, width, rows)
+        frames: list[str] = []
+        while limit is None or len(frames) < limit:
+            ok, frame = cap.read()
+            if not ok:
                 break
-        time.sleep(0.1)
-
-
-# 3. Video Processing Phase (or load from cache)
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(video_path)) or '.', '.ascii_cache')
-
-
-def compute_cache_key(w):
-    """Fingerprints the video file plus every setting that changes the rendered
-    output, so a cache is only reused when it's guaranteed to match exactly --
-    if the video file or any relevant flag changes, this key changes too."""
-    stat = os.stat(video_path)
-    fingerprint = (
-        os.path.abspath(video_path), stat.st_mtime, stat.st_size,
-        use_edge, use_color, use_negative, use_mozaic,
-        use_wish, WISH if use_wish else None,
-        max_frames, start_time, end_time, w,
-    )
-    return hashlib.sha256(repr(fingerprint).encode()).hexdigest()[:16]
-
-
-width = 120 if use_edge else 100
-
-cache_path = None
-if use_save and not is_image:
-    cache_path = os.path.join(
-        CACHE_DIR, f"{os.path.basename(video_path)}.{compute_cache_key(width)}.cache"
-    )
-
-ascii_frames = []  # list of (char_rows, color_codes_or_None)
-fps = None
-delay = None
-loaded_from_cache = False
-
-if cache_path is not None and os.path.exists(cache_path):
-    print("Matching cache found -- loading pre-rendered frames instead of reprocessing...")
-    with open(cache_path, 'rb') as f:
-        cached = pickle.load(f)
-    ascii_frames = cached['ascii_frames']
-    fps = cached['fps']
-    delay = cached['delay']
-    loaded_from_cache = True
-    print(f"Loaded {len(ascii_frames)} cached frames.")
-
-if not loaded_from_cache:
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    delay = 1.0 / fps if fps > 0 else 0.04
-
-    video_duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps > 0 else None
-    if start_time is not None and video_duration is not None and start_time >= video_duration:
-        print(f"Error: -start ({start_time}s) is beyond the video length ({video_duration:.1f}s)")
-        sys.exit(1)
-
-    if start_time is not None:
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
-
-    end_time_ms = end_time * 1000 if end_time is not None else None
-
-    frame_limit_note = f" (capped at {max_frames} frames)" if max_frames is not None else ""
-    if start_time is not None or end_time is not None:
-        range_start = f"{start_time}s" if start_time is not None else "start"
-        range_end = f"{end_time}s" if end_time is not None else "end"
-        frame_limit_note += f" [range {range_start} -> {range_end}]"
-    if use_color:
-        frame_limit_note += " [true per-pixel color matching]"
-    if use_negative:
-        frame_limit_note += " [negative]"
-
-    mode_label = "Edge Detection" if use_edge else "Brightness Gradient"
-    
-    if not is_image:
-        print(f"Processing video via {mode_label} mode...{frame_limit_note}")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if end_time_ms is not None and cap.get(cv2.CAP_PROP_POS_MSEC) > end_time_ms:
-            break
-
-        if use_negative:
-            # Invert every channel (255 - value) so both the brightness-driven character
-            # choice and the color match reflect the negative image, not just the color.
-            frame = 255 - frame
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h_orig, w_orig = gray.shape
-        height = max(1, int((width * h_orig / w_orig) * 0.5))  # Squashed for terminal aspect ratio
-        gray_small = cv2.resize(gray, (width, height))
-
-        char_rows = []
-        if use_edge:
-            blurred = cv2.GaussianBlur(gray_small, (3, 3), 0)
-            edges = cv2.Canny(blurred, 50, 150)
-            for y in range(height):
-                row_chars = []
-                for x in range(width):
-                    edge_val = edges[y, x]
-                    pixel_val = gray_small[y, x]
-                    if edge_val > 0:
-                        idx = int(pixel_val / 256 * len(EDGE_CHARS))
-                        row_chars.append(EDGE_CHARS[idx])
-                    else:
-                        row_chars.append(" " if pixel_val < 128 else ".")
-                char_rows.append(row_chars)
-        else:
-            for y in range(height):
-                row_chars = []
-                for x in range(width):
-                    pixel_val = gray_small[y, x]
-                    idx = min(int(pixel_val / 256 * len(ASCII_GRADIENT)), len(ASCII_GRADIENT) - 1)
-                    
-                    if use_wish:
-                        wish_ptr = (wish_ptr + 1) % len(WISH)
-                        ASCII_GRADIENT = WISH[wish_ptr]
-
-                    row_chars.append(ASCII_GRADIENT[idx])
-                char_rows.append(row_chars)
-
-        color_codes = None
-        if use_color:
-            color_small_bgr = cv2.resize(frame, (width, height))
-            color_small_rgb = cv2.cvtColor(color_small_bgr, cv2.COLOR_BGR2RGB)
-            color_codes = rgb_array_to_ansi256(color_small_rgb)
-
-        ascii_frames.append((char_rows, color_codes))
-
-        if max_frames is not None and len(ascii_frames) >= max_frames:
-            break
-
-    cap.release()
-
-    if cache_path is not None:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(cache_path, 'wb') as f:
-            pickle.dump({'ascii_frames': ascii_frames, 'fps': fps, 'delay': delay},
-                        f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"Saved {len(ascii_frames)} frames to cache -- future runs with the same "
-              f"video and flags will load instantly instead of reprocessing.")
-
-if is_image:
-    print("Conversion finished. Rendering image...")
-else:
-    print(f"Conversion finished. Playing {len(ascii_frames)} frames...")
-time.sleep(1)
-
-# 4. Playback
-bgr_chk = threading.Thread(target=check_esc, daemon=True)
-bgr_chk.start()
-
-if is_image:
-    # For a single image there's nothing to animate, and clearing the terminal would
-    # just wipe the art away immediately -- print it once, straight to normal
-    # scrollback, and leave it on screen.
-    char_rows, color_codes = ascii_frames[0] if Path(video_path).exists() else sys.exit(0)
-    frame_string = build_frame_string(char_rows, color_codes)
-    print_with_delay(frame_string)
-else:
-
-    # Launch audio as close as possible to the moment playback actually starts --
-    # not during frame conversion above, which can take a while and would leave
-    # audio running far ahead by the time rendering catches up. ffplay is used
-    # instead of a GUI player because it's headless (-nodisp), exits itself when
-    # done (-autoexit), and -ss gives it real seek support matching -start.
-    audio_process = None
-    audio_start = start_time if start_time is not None else 0
-    try:
-        audio_process = subprocess.Popen(
-            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-             "-ss", str(audio_start), video_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        print("Note: ffplay not found -- skipping audio. Install ffmpeg (winget install ffmpeg) to enable it.")
-
-    try:
-        # Enter the alternate screen buffer and hide the cursor. The alt buffer is a
-        # fixed-size canvas with no scrollback, so "\033[H" always lands at the true
-        # top-left of the visible viewport -- no more scrolling out from under us.
-        sys.stdout.write("\033[?1049h\033[?25l")
-        sys.stdout.flush()
-
-        # Anchor every frame to real elapsed wall-clock time instead of chaining
-        # sleeps -- this is what actually fixes the drift, since sleep(delay) per
-        # frame ignores the time spent building/printing each frame and the error
-        # compounds over the whole clip.
-        playback_start = time.perf_counter()
-        for i, (char_rows, color_codes) in enumerate(ascii_frames):
-            frame_string = build_frame_string(char_rows, color_codes)
-
-            # Move to home and overwrite in place -- no full clear needed each frame,
-            # which also cuts down on flicker.
-            sys.stdout.write("\033[H" + frame_string)
-            sys.stdout.flush()
-
-            if playback_speed <= 0:
-                continue  # ESC was pressed: blast through remaining frames instantly
-
-            target_time = i * delay
-            elapsed = time.perf_counter() - playback_start
-            sleep_time = target_time - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            # If we're already behind target_time, skip the sleep entirely rather
-            # than adding it on top -- this is what keeps video from permanently
-            # lagging further behind the audio as the clip goes on.
-
+            frames.append(renderer.render(frame))
+            if len(frames) % 10 == 0:
+                total_txt = f"/{expected}" if expected else ""
+                print(f"\r  frame {len(frames)}{total_txt}", end="", flush=True)
+        print()
     finally:
-        # Always restore the normal screen buffer and cursor, even on Ctrl+C or error,
-        # so the user's shell isn't left in a broken state.
-        sys.stdout.write("\033[?25h\033[?1049l")
-        sys.stdout.flush()
-        if audio_process is not None:
-            audio_process.terminate()
+        cap.release()
 
+    if not frames:
+        raise UserError("no frames could be read from the video (check -start/-end)")
+    if cache_path:
+        save_cache(cache_path, frames, fps)
+    return frames, fps
+
+
+def play_video(frames: list[str], fps: float, opts: argparse.Namespace) -> None:
+    delay = 1.0 / fps
+    count = len(frames)
+
+    ffplay = shutil.which("ffplay")
+    if ffplay is None:
+        print("Note: ffplay not found -- playing without audio. Install ffmpeg to enable it.")
+
+    audio = None
+    out = sys.stdout
+    try:
+        # Alternate screen buffer: fixed canvas, no scrollback, so "\x1b[H" is always top-left.
+        out.write("\x1b[?1049h\x1b[?25l")
+        out.flush()
+        with KeyListener() as keys:
+            if ffplay:
+                cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet"]
+                if opts.start:
+                    cmd += ["-ss", str(opts.start)]
+                cmd += ["-t", f"{count * delay:.3f}", opts.path]
+                audio = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # The frame shown is derived from real elapsed time. A slow terminal drops
+            # frames instead of falling behind the audio.
+            started = time.perf_counter()
+            last = -1
+            while True:
+                if keys.abort_requested():
+                    break
+                elapsed = time.perf_counter() - started
+                index = int(elapsed / delay)
+                if index >= count:
+                    break
+                if index != last:
+                    out.write("\x1b[H" + frames[index])
+                    out.flush()
+                    last = index
+                wait = (index + 1) * delay - (time.perf_counter() - started)
+                if wait > 0:
+                    time.sleep(min(wait, 0.02))  # short naps keep key polling responsive
+    finally:
+        out.write("\x1b[?25h\x1b[?1049l")
+        out.flush()
+        if audio is not None:
+            audio.terminate()
     print("Playback finished.")
+
+
+# -------------------------------------------------------------------------- image
+
+TOKEN = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|.", re.DOTALL)
+
+
+def type_out(text: str, char_delay: float) -> None:
+    """Type the art out character by character into normal scrollback (Esc/q skips ahead)."""
+    out = sys.stdout
+    if char_delay <= 0:
+        out.write(text + "\n")
+        out.flush()
+        return
+    skipping = False
+    shown = 0
+    started = time.perf_counter()
+    with KeyListener() as keys:
+        for match in TOKEN.finditer(text):
+            token = match.group()
+            out.write(token)
+            if skipping or token.startswith("\x1b"):
+                continue
+            shown += 1
+            wait = started + shown * char_delay - time.perf_counter()
+            if wait > 0:  # only sleep when ahead of schedule; catches up in batches otherwise
+                out.flush()
+                time.sleep(wait)
+                if keys.abort_requested():
+                    skipping = True
+    out.write("\n")
+    out.flush()
+
+
+def show_image(opts: argparse.Namespace, term) -> None:
+    data = np.fromfile(opts.path, dtype=np.uint8)  # imdecode handles non-ASCII paths on Windows
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+    if image is None:
+        raise UserError(f"could not read image: {opts.path}")
+    height, width_px = image.shape[:2]
+    width, rows = pick_size(width_px, height, opts, term, fit_height=False)
+    print("Rendering image...")
+    type_out(Renderer(opts, width, rows).render(image), opts.typedelay)
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv=None) -> int:
+    opts = parse_args(argv)
+    try:
+        if not os.path.isfile(opts.path):
+            raise UserError(f"file not found: {opts.path}")
+        for note in normalise_flags(opts):
+            print("Note:", note)
+
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        enable_windows_ansi()
+        term = shutil.get_terminal_size(fallback=(120, 40))
+
+        if os.path.splitext(opts.path)[1].lower() in IMAGE_EXTENSIONS:
+            show_image(opts, term)
+        else:
+            frames, fps = load_video_frames(opts, term)
+            print(f"Conversion finished. Playing {len(frames)} frames...")
+            time.sleep(0.5)
+            play_video(frames, fps, opts)
+    except UserError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
