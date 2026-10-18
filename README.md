@@ -60,6 +60,7 @@ Run `python wdanim.py --help` for a summary.
 | `-save` | none | Cache rendered frames in a `.ascii_cache/` folder next to the video. |
 | `-width` | `N` | Width in characters. Default: fit the terminal. |
 | `-typedelay` | `SECONDS` | Per-character delay when typing out an image. Default `0.005`; `0` prints instantly. |
+| `-hold` | none | Keep the last frame on screen after a video ends (or is skipped with `Esc`/`q`). |
 
 ### Examples
 
