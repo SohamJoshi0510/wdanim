@@ -83,6 +83,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="width in characters (default: fit the terminal)")
     p.add_argument("-typedelay", type=float, default=0.005, metavar="SECONDS",
                    help="per-character delay when typing out an image (default 0.005, 0 = instant)")
+    p.add_argument("-hold", action="store_true",
+                    help="keep the last frame on screen after a video ends (or is skipped with Esc/q)")
     args = p.parse_args(argv)
     if args.start is not None and args.end is not None and args.end <= args.start:
         p.error("-end must be greater than -start")
@@ -454,6 +456,8 @@ def play_video(frames: list[str], fps: float, opts: argparse.Namespace) -> None:
                     time.sleep(min(wait, 0.02))  # short naps keep key polling responsive
     finally:
         out.write("\x1b[?25h\x1b[?1049l")
+        if opts.hold:
+            out.write(frames[-1] + "\n")   # print into normal scrollback so it survives after exit
         out.flush()
         if audio is not None:
             audio.terminate()
@@ -502,10 +506,114 @@ def show_image(opts: argparse.Namespace, term) -> None:
     print("Rendering image...")
     type_out(Renderer(opts, width, rows).render(image), opts.typedelay)
 
+def launch_gui():
+    """Launcher window shown when wdanim is run with no arguments.
+    Returns an argv list for parse_args, or None if the window was closed."""
+    try:
+        import customtkinter as ctk
+        from tkinter import filedialog
+    except ImportError:
+        print("No arguments given. For the launcher window run:  pip install customtkinter")
+        print("Or see the options with:  wdanim --help")
+        return None
+    import contextlib
+    import io
+
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
+    root.title("wdanim")
+    root.geometry("520x680")
+
+    result = {"argv": None}
+    path_var = ctk.StringVar()
+    flags = {name: ctk.BooleanVar() for name in ("color", "edge", "negative", "moz", "save", "hold")}
+    fields = {name: ctk.StringVar() for name in ("wish", "frames", "start", "end", "width", "typedelay")}
+
+    ctk.CTkLabel(root, text="wdanim", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(16, 8))
+
+    # file picker
+    row = ctk.CTkFrame(root, fg_color="transparent")
+    row.pack(fill="x", padx=20)
+    ctk.CTkEntry(row, textvariable=path_var, placeholder_text="Video or image file").pack(
+        side="left", fill="x", expand=True)
+
+    def browse():
+        chosen = filedialog.askopenfilename(
+            title="Choose a video or image",
+            filetypes=[("Video / image", "*.mp4 *.mkv *.avi *.mov *.webm *.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                       ("All files", "*.*")])
+        if chosen:
+            path_var.set(chosen)
+
+    ctk.CTkButton(row, text="Browse", width=80, command=browse).pack(side="left", padx=(8, 0))
+
+    # on/off flags
+    checks = ctk.CTkFrame(root)
+    checks.pack(fill="x", padx=20, pady=12)
+    labels = {"color": "Color", "edge": "Edge detect", "negative": "Negative",
+              "moz": "Mosaic", "save": "Cache frames", "hold": "Hold last frame"}
+    for i, (name, text) in enumerate(labels.items()):
+        ctk.CTkCheckBox(checks, text=text, variable=flags[name]).grid(
+            row=i // 2, column=i % 2, sticky="w", padx=14, pady=6)
+
+    # flags that take a value
+    form = ctk.CTkFrame(root)
+    form.pack(fill="x", padx=20)
+    form.grid_columnconfigure(1, weight=1)
+    entries = [("wish", "Wish text", "e.g. HAPPYBIRTHDAY"),
+               ("frames", "Max frames", "all"),
+               ("start", "Start", "0:30"),
+               ("end", "End", "1:15"),
+               ("width", "Width (chars)", "fit terminal"),
+               ("typedelay", "Type delay (s)", "0.005 (images)")]
+    for i, (name, label, hint) in enumerate(entries):
+        ctk.CTkLabel(form, text=label).grid(row=i, column=0, sticky="w", padx=14, pady=6)
+        ctk.CTkEntry(form, textvariable=fields[name], placeholder_text=hint).grid(
+            row=i, column=1, sticky="ew", padx=14, pady=6)
+
+    status = ctk.CTkLabel(root, text="", text_color="#ff6b6b", wraplength=470)
+    status.pack(pady=(10, 0))
+
+    def build_argv():
+        if fields["wish"].get().strip():
+            flags["color"].set(True)          # -wish needs -color
+        argv = [path_var.get().strip().strip('"')]
+        argv += [f"-{name}" for name, var in flags.items() if var.get()]
+        for name, var in fields.items():
+            value = var.get().strip()
+            if value:
+                argv += [f"-{name}", value]
+        return argv
+
+    def run():
+        argv = build_argv()
+        if not argv[0] or not os.path.isfile(argv[0]):
+            status.configure(text="Choose an existing video or image file.")
+            return
+        errors = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(errors):
+                parse_args(argv)              # reuse the real validation
+        except SystemExit:
+            lines = errors.getvalue().strip().splitlines()
+            status.configure(text=lines[-1] if lines else "Invalid options.")
+            return
+        result["argv"] = argv
+        root.destroy()
+
+    ctk.CTkButton(root, text="Run", height=40, command=run).pack(pady=16, padx=20, fill="x")
+    root.bind("<Return>", lambda event: run())
+    root.mainloop()
+    return result["argv"]
 
 # --------------------------------------------------------------------------- main
 
 def main(argv=None) -> int:
+    if argv is None and len(sys.argv) == 1:      # no arguments -> show the launcher
+        argv = launch_gui()
+        if argv is None:
+            return 0
     opts = parse_args(argv)
     try:
         if not os.path.isfile(opts.path):
